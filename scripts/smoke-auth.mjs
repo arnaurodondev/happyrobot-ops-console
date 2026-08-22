@@ -77,5 +77,30 @@ for (const p of MUST_200_PUBLIC) {
   report("forged cookie", "/api/kpis", res.status, (s) => s === 401);
 }
 
+// Login throttle: the per-client bucket is keyed on X-Forwarded-For, which the
+// CLIENT sets, so rotating it defeats that layer by design. The control that
+// matters is the process-wide floor, which no header can move. Opt-in, because
+// passing this check leaves NEW sign-ins locked out for 15 minutes — do not run
+// it against the deployment you are about to demo.
+if (process.env.SMOKE_THROTTLE === "1") {
+  console.log("\nThrottle check (SMOKE_THROTTLE=1) — rotating X-Forwarded-For per attempt…");
+  let blockedAt = null;
+  for (let i = 1; i <= 40 && blockedAt === null; i++) {
+    const res = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Forwarded-For": `203.0.113.${i}` },
+      body: JSON.stringify({ user: "ops", password: `wrong-${i}` }),
+    });
+    if (res.status === 429) blockedAt = i;
+  }
+  report(
+    "throttle floor",
+    "40 spoofed IPs must still get blocked",
+    blockedAt === null ? "never blocked" : `429 at attempt ${blockedAt}`,
+    () => blockedAt !== null,
+  );
+  console.log("  NOTE: new sign-ins are now locked for 15 minutes. Live sessions are unaffected.");
+}
+
 console.log(`\n${failures === 0 ? "All checks passed." : `${failures} check(s) FAILED.`}`);
 process.exit(failures === 0 ? 0 : 1);

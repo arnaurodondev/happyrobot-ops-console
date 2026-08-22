@@ -10,6 +10,7 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "seed:demo": "node scripts/seed-demo.mjs --apply",
+    "seed:adversarial": "node scripts/seed-demo.mjs --apply --adversarial",
     "seed:purge": "node scripts/seed-demo.mjs --purge",
     "smoke:auth": "node scripts/smoke-auth.mjs"
   },

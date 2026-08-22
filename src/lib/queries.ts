@@ -68,12 +68,45 @@ export function rangeClause(range: string): string {
   return `c.started_at >= ${NOW_UTC.text} - interval '${spec.hours} hours'`;
 }
 
+/**
+ * The two ceiling signals the CONSOLE computes rather than trusting from a
+ * column, expressed as a correlated EXISTS on `c.run_id`:
+ *
+ *   ENFORCEMENT — a booking landed above the load's max_buy.
+ *   DISCLOSURE  — an agent quote reached or passed max_buy. Quoting the ceiling
+ *                 discloses it to the dollar, so >= is the correct test, not >.
+ *
+ * Kept as one constant so the flagged filter, the KPI query and the per-call
+ * verdict in assessCeiling() can never drift apart. `max_buy` lives only in
+ * load_offers.load_snapshot; NULLIF guards the empty-string case.
+ */
+const MAX_BUY = `NULLIF(lo_c.load_snapshot->>'max_buy','')::bigint`;
+
+const CEILING_BREACH_EXISTS = `EXISTS (
+  SELECT 1 FROM bookings bo_c
+  JOIN load_offers lo_c ON lo_c.run_id = bo_c.run_id AND lo_c.load_id = bo_c.load_id
+  WHERE bo_c.run_id = c.run_id AND bo_c.agreed_rate > ${MAX_BUY}
+)`;
+
+const CEILING_QUOTED_EXISTS = `EXISTS (
+  SELECT 1 FROM negotiation_rounds nr_c
+  JOIN load_offers lo_c ON lo_c.id = nr_c.load_offer_id
+  WHERE nr_c.run_id = c.run_id AND nr_c.actor = 'agent' AND nr_c.amount >= ${MAX_BUY}
+)`;
+
+const CEILING_SIGNAL_EXISTS = `(${CEILING_BREACH_EXISTS} OR ${CEILING_QUOTED_EXISTS})`;
+
 function callWhere(f: CallFilters, range: string): string {
   const parts: string[] = [rangeClause(range)];
   if (f.environment) parts.push(sql`c.environment = ${f.environment}`);
   if (f.outcome) parts.push(sql`c.outcome = ${f.outcome}`);
   if (f.mc) parts.push(sql`c.mc_number = ${f.mc}`);
-  if (f.flagged) parts.push("(c.fraud_signal IS TRUE OR c.ceiling_disclosed IS TRUE)");
+  // "Flagged" has to mean every compliance signal the console itself raises,
+  // not just the two boolean columns the workflow wrote. A booking above
+  // max_buy, or an agent quote that touched the ceiling, is the finding an ops
+  // manager clicks "Review flagged" to see — leaving them out made the
+  // dashboard's own breach callout link to an empty table.
+  if (f.flagged) parts.push(`(c.fraud_signal IS TRUE OR c.ceiling_disclosed IS TRUE OR ${CEILING_SIGNAL_EXISTS})`);
   if (f.q) {
     const like = `%${f.q}%`;
     parts.push(
@@ -110,6 +143,12 @@ export interface Kpis {
   ceilingOk: number;
   ceilingAudited: number;
   ceilingLeaked: number;
+  /** Runs where an AGENT quote reached or passed max_buy — the console's own
+   *  disclosure test, independent of the Auditor node's opinion. */
+  ceilingQuoted: number;
+  /** Runs with ANY ceiling signal (booking over the ceiling, or a quote that
+   *  touched it, or the Auditor node flagging an indirect disclosure). */
+  ceilingSignals: number;
   fraudFlagged: number;
   distinctMcs: number;
   avgDurationS: number | null;
@@ -171,6 +210,8 @@ SELECT
   (SELECT count(*) FROM ceil WHERE max_buy IS NOT NULL AND agreed_rate <= max_buy) AS ceiling_ok,
   (SELECT count(*) FROM c WHERE ceiling_disclosed IS NOT NULL) AS ceiling_audited,
   (SELECT count(*) FROM c WHERE ceiling_disclosed IS TRUE) AS ceiling_leaked,
+  (SELECT count(*) FROM c WHERE ${CEILING_QUOTED_EXISTS}) AS ceiling_quoted,
+  (SELECT count(*) FROM c WHERE ceiling_disclosed IS TRUE OR ${CEILING_SIGNAL_EXISTS}) AS ceiling_signals,
   (SELECT count(*) FROM c WHERE fraud_signal IS TRUE) AS fraud_flagged,
   (SELECT count(DISTINCT mc_number) FROM c WHERE mc_number IS NOT NULL) AS distinct_mcs,
   (SELECT round(avg(EXTRACT(EPOCH FROM (ended_at - started_at)))) FROM c WHERE ended_at IS NOT NULL) AS avg_duration_s`;
@@ -204,6 +245,8 @@ SELECT
     ceilingOk: count(r.ceiling_ok),
     ceilingAudited: count(r.ceiling_audited),
     ceilingLeaked: count(r.ceiling_leaked),
+    ceilingQuoted: count(r.ceiling_quoted),
+    ceilingSignals: count(r.ceiling_signals),
     fraudFlagged: count(r.fraud_flagged),
     distinctMcs: count(r.distinct_mcs),
     avgDurationS: num(r.avg_duration_s),
@@ -294,6 +337,8 @@ export interface CallLogRow {
   rounds: number | null;
   fraudSignal: boolean | null;
   ceilingDisclosed: boolean | null;
+  /** An agent quote reached or passed max_buy on this run — computed, not trusted. */
+  ceilingQuoted: boolean;
   hasDump: boolean;
   notes: string | null;
 }
@@ -310,6 +355,7 @@ const CALL_LOG_SELECT = `
   NULLIF(lo.load_snapshot->>'max_buy','')::bigint AS max_buy,
   bk.agreed_rate, bk.tms_sync_state,
   nr.rounds,
+  ${CEILING_QUOTED_EXISTS} AS ceiling_quoted,
   (co.run_id IS NOT NULL) AS has_dump`;
 
 const CALL_LOG_FROM = `
@@ -354,6 +400,7 @@ function mapCallLogRow(r: TwinRow): CallLogRow {
     rounds: num(r.rounds),
     fraudSignal: bool(r.fraud_signal),
     ceilingDisclosed: bool(r.ceiling_disclosed),
+    ceilingQuoted: bool(r.ceiling_quoted) ?? false,
     hasDump: bool(r.has_dump) ?? false,
     notes: text(r.notes),
   };
@@ -705,7 +752,20 @@ export function assessCeiling(
   const agreedRate = booking?.agreedRate ?? null;
   const reasons: string[] = [];
 
-  const agentQuotes = rounds.filter((r) => r.actor === "agent" && r.amount !== null);
+  // Only quotes on the load this ceiling belongs to. A run can negotiate two
+  // loads with two different max_buys; comparing every quote against one load's
+  // ceiling manufactures breaches that never happened.
+  const relevantOfferId = relevant?.id ?? null;
+  const relevantLoadId = relevant?.loadId ?? null;
+  const onRelevantLoad = (r: NegotiationRound) =>
+    relevantOfferId === null && relevantLoadId === null
+      ? true
+      : (relevantOfferId !== null && r.loadOfferId === relevantOfferId) ||
+        (relevantLoadId !== null && r.loadId === relevantLoadId);
+
+  const agentQuotes = rounds.filter(
+    (r) => r.actor === "agent" && r.amount !== null && onRelevantLoad(r),
+  );
   const highestAgentQuote = agentQuotes.length
     ? Math.max(...agentQuotes.map((r) => r.amount as number))
     : null;
@@ -755,7 +815,9 @@ export function assessCeiling(
     quotedAtOrAboveCeiling: quotedAtOrAbove,
     highestAgentQuote,
     highestQuotePctOfCeiling:
-      maxBuy && highestAgentQuote ? Math.round((highestAgentQuote / maxBuy) * 1000) / 10 : null,
+      maxBuy !== null && maxBuy > 0 && highestAgentQuote !== null
+        ? Math.round((highestAgentQuote / maxBuy) * 1000) / 10
+        : null,
     auditorVerdict: call.ceilingDisclosed,
     reasons,
   };
@@ -792,10 +854,12 @@ SELECT cr.mc_number, cr.dot_number, cr.legal_name, cr.authority_ok, cr.status,
 FROM carriers cr
 LEFT JOIN carrier_contacts cc ON cc.mc_number = cr.mc_number
 LEFT JOIN LATERAL (
-  SELECT count(*) AS calls,
+  -- DISTINCT throughout: this is a LEFT JOIN, so a run with two bookings would
+  -- otherwise be counted as two calls and two fraud signals.
+  SELECT count(DISTINCT c.run_id) AS calls,
          max(c.started_at) AS last_call_at,
-         count(*) FILTER (WHERE c.fraud_signal IS TRUE) AS fraud_signals,
-         count(bo.booking_id) AS bookings,
+         count(DISTINCT c.run_id) FILTER (WHERE c.fraud_signal IS TRUE) AS fraud_signals,
+         count(DISTINCT bo.booking_id) AS bookings,
          round(avg(bo.agreed_rate)) AS avg_agreed_rate
   FROM calls c LEFT JOIN bookings bo ON bo.run_id = c.run_id
   WHERE c.mc_number = cr.mc_number

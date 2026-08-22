@@ -276,7 +276,7 @@ function CeilingCard({ detail: d }: { detail: CallDetail }) {
               <th>max_buy (ceiling)</th>
               <td className="mono strong">
                 {money(a.maxBuy)}
-                {a.postedRate && a.maxBuy && (
+                {a.postedRate !== null && a.postedRate > 0 && a.maxBuy !== null && (
                   <span className="muted">
                     {" "}
                     · {percent((a.maxBuy / a.postedRate) * 100, 1)} of posted

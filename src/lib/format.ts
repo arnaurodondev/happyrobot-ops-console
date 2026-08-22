@@ -146,10 +146,14 @@ export function shortId(v: string | null | undefined, len = 8): string {
  * treat as a formula. Carrier speech reaches call_outcomes.notes and calls.notes
  * through post-call extraction, so an exported row is untrusted text.
  */
+/** A plain number can never be a formula, so it must not be quoted into text —
+ *  otherwise every negative rate/headroom lands in Excel as a string. */
+const PLAIN_NUMBER = /^-?(?:\d+)(?:\.\d+)?$/;
+
 export function csvCell(v: unknown): string {
   if (v === null || v === undefined) return "";
   let s = String(v);
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  if (/^[=+\-@\t\r]/.test(s) && !PLAIN_NUMBER.test(s)) s = `'${s}`;
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }

@@ -30,9 +30,17 @@ No App needs to exist on the platform for this to work — the console talks to 
 The Twin database is live but starts empty. To populate it with a realistic set of 14 calls across every outcome the workflow can produce:
 
 ```bash
-npm run seed:demo     # write
-npm run seed:purge    # remove every trace
+npm run seed:demo        # write the 14-call happy path
+npm run seed:adversarial # 14 + 2 adversarial fixtures (see below)
+npm run seed:purge       # remove every trace
 ```
+
+**Adversarial fixtures** (`--adversarial`) add two runs that exist to prove the console's defences on screen, not to flatter it:
+
+1. **Ceiling breach** — the agent's ladder walks *through* `max_buy` and the booking lands above it. Exercises the `BREACH` verdict, the `Over ceiling` flag, the flagged-calls filter, and drags the adherence KPI off 100%.
+2. **Untrusted carrier speech** — `notes` is written by post-call AI extraction from what the carrier said, so it is attacker-controlled text. This row carries `<script>`, an `onerror=` handler, an `<svg/onload>`, and all four spreadsheet formula prefixes (`=`, `+`, `-`, `@`). Rendered escaped in every surface; formula-prefixed in the CSV.
+
+Both live in the same reserved namespace, so `seed:purge` removes them with everything else.
 
 The seeder is **fully reversible by construction**: every seeded call uses a `run_id` in the reserved `deadbee0-…` namespace with `environment='demo'`, detail rows come out via the schema's own `ON DELETE CASCADE`, and `call_outcomes` (no FK, because the run dump provisions it) plus the seeded carrier rows are removed by the same reserved keys. It never touches a row it did not create. **Purge it before the workflow's real runs matter.**
 
@@ -57,10 +65,11 @@ The seeder is **fully reversible by construction**: every seeded call uses a `ru
 | OTP failure rate | `otp_attempts` (send rows excluded from the denominator) |
 | **Rate-ceiling adherence (target 100%)** | `bookings.agreed_rate ≤ load_offers.load_snapshot→max_buy` |
 | Average negotiation rounds (cap 3) | `max(negotiation_rounds.round_no) WHERE actor='agent'` |
-| Average agreed vs posted | `bookings.agreed_rate ÷ load_offers.posted_rate` |
+| Average agreed vs posted | mean of the per-load ratio `bookings.agreed_rate ÷ load_offers.posted_rate` (not the ratio of the two averages shown beside it — they differ by a few tenths on small samples) |
 | Average call duration, abandoned, in flight | `calls.started_at / ended_at` |
 | Fraud signals | `calls.fraud_signal`, ≥3 failed OTP attempts on a run, FMCSA rejections |
-| Ceiling-disclosure audit | `calls.ceiling_disclosed` (the native Carrier Sales Auditor node's verdict) |
+| **Ceiling disclosure — quoted** | `negotiation_rounds.amount >= max_buy WHERE actor='agent'` — computed here, not trusted from a column. Quoting the ceiling discloses it to the dollar, so `>=` is the test. |
+| Ceiling disclosure — Auditor node | `calls.ceiling_disclosed` (the native Carrier Sales Auditor node's verdict on indirect disclosure in the transcript) |
 | TMS sync exceptions | `bookings.tms_sync_state` — `ambiguous` is never auto-retried |
 
 ### Ceiling adherence is computed, not trusted
@@ -125,7 +134,9 @@ PASS  forged cookie          unsigned session token             401
 
 One username and one password from server-only env vars, an 8-hour HMAC-signed `httpOnly` / `SameSite=Lax` / `Secure` session cookie, and constant-time comparison on both fields. **Production posture** is the customer's IdP in front of the App (or HappyRobot workspace auth once Apps expose the signed-in user to app code) — raised as open question 8 in the summary email. The console **refuses to serve any data** if `OPS_CONSOLE_PASSWORD` is unset; it does not fall back to open access.
 
-**Login throttling:** 6 failures per IP in a 15-minute window, then a 15-minute lockout, with a randomised 250–400 ms floor on every attempt so a wrong username is not measurably faster than a wrong password. The bucket is in-memory — honestly stated: a serverless platform may run several instances, so the effective budget is *(6 × instances)*. That turns an unbounded online guessing attack into a slow one; it is not a substitute for a real IdP.
+**Login throttling — two layers.** *Per client:* 6 failures in a 15-minute window, then a 15-minute lockout. That bucket is keyed on `X-Forwarded-For`, which the **client** sets, so rotating the header defeats it — it is a courtesy that stops one operator locking out the team, not a control. *Process-wide floor:* 20 failures per 15-minute window, keyed on nothing the caller can influence, then a 15-minute lockout. A header-rotating attacker is capped at 20 guesses per window rather than being unlimited, and this is the layer that actually protects a shared credential on a public URL. Every attempt also carries a randomised 250–400 ms floor so a wrong username is not measurably faster than a wrong password.
+
+The accepted trade-off: 20 bad guesses from anywhere freeze **new sign-ins** for 15 minutes. Live sessions are unaffected — the lockout guards `POST /api/auth/login` only, never session validation. A 15-minute sign-in delay is a much cheaper outcome than a guessed credential. Both buckets are in-memory, so on a multi-instance serverless platform the effective budget is *(max × instances)*; none of this is a substitute for a real IdP. `SMOKE_THROTTLE=1 npm run smoke:auth` proves the floor holds against 40 spoofed source IPs.
 
 ### Data access
 

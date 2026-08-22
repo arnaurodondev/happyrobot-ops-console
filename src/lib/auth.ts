@@ -183,16 +183,39 @@ export function checkCredential(user: string, password: string): boolean {
 }
 
 /**
- * Per-client login throttle. In-memory on purpose: this is a single-tenant POC
- * console behind one shared credential, and a Redis dependency would be more
- * moving parts than the control is worth. The honest limitation — stated in
- * the README — is that a serverless platform may run several instances, so the
- * effective budget is (WINDOW_MAX x instances). It still turns an unbounded
- * online guessing attack into a slow one, and the lockout is logged.
+ * Login throttle, in two layers.
+ *
+ * LAYER 1 — per client key. Good UX: one careless operator does not lock out
+ * the whole team. The key is derived from X-Forwarded-For, which is CLIENT
+ * SUPPLIED and therefore SPOOFABLE. Rotating that header defeats layer 1
+ * completely, and a locked-out client escapes its own lockout just by
+ * prepending a fake hop. So layer 1 is a courtesy, not a control.
+ *
+ * LAYER 2 — a process-wide floor that no header can move. Every failed attempt
+ * counts against it regardless of who claims to have made it, so a header-
+ * rotating attacker is capped at GLOBAL_MAX guesses per window rather than
+ * being unlimited. This is the layer that actually protects a shared
+ * credential on a public URL.
+ *
+ * ACCEPTED TRADE-OFF: 20 bad guesses from anywhere freeze NEW sign-ins for 15
+ * minutes, so an anonymous attacker can deny sign-in. That is deliberate. Live
+ * sessions are unaffected — the lockout only guards POST /api/auth/login, never
+ * session validation — so an ops manager already signed in keeps working, and a
+ * 15-minute sign-in delay is a far cheaper outcome than a guessed shared
+ * credential on a public URL that renders max_buy.
+ *
+ * In-memory on purpose: this is a single-tenant POC console behind one shared
+ * credential, and Redis would be more moving parts than the control is worth.
+ * The honest limitation — stated in the README — is that a serverless platform
+ * may run several instances, so the effective budget is (MAX x instances).
  */
 const WINDOW_MS = 15 * 60 * 1000;
 const WINDOW_MAX = 6;
 const LOCKOUT_MS = 15 * 60 * 1000;
+/** Process-wide failure budget per window. Unspoofable: not keyed on anything. */
+const GLOBAL_MAX = 20;
+const GLOBAL_LOCKOUT_MS = 15 * 60 * 1000;
+const GLOBAL_KEY = " global";
 
 interface Bucket {
   failures: number[];
@@ -213,17 +236,23 @@ function sweep() {
   if (buckets.size < 512) return;
   const cutoff = Date.now() - WINDOW_MS;
   for (const [k, b] of buckets) {
+    if (k === GLOBAL_KEY) continue;
     if (b.lockedUntil < Date.now() && (b.failures.at(-1) ?? 0) < cutoff) {
       buckets.delete(k);
     }
   }
 }
 
+/**
+ * Best-effort client identity for the per-client layer only. X-Forwarded-For is
+ * attacker-controlled — the leading space on GLOBAL_KEY keeps a caller from
+ * ever colliding with (and thereby reading or resetting) the global bucket.
+ */
 export async function clientKey(): Promise<string> {
   const h = await headers();
   const fwd = h.get("x-forwarded-for");
   const ip = fwd ? fwd.split(",")[0]!.trim() : h.get("x-real-ip") || "unknown";
-  return ip || "unknown";
+  return `ip:${ip || "unknown"}`;
 }
 
 export interface ThrottleState {
@@ -232,8 +261,7 @@ export interface ThrottleState {
   remaining: number;
 }
 
-export function throttleCheck(key: string): ThrottleState {
-  sweep();
+function checkBucket(key: string, max: number): ThrottleState {
   const b = bucketFor(key);
   const now = Date.now();
   if (b.lockedUntil > now) {
@@ -244,34 +272,61 @@ export function throttleCheck(key: string): ThrottleState {
     };
   }
   b.failures = b.failures.filter((t) => t > now - WINDOW_MS);
-  return {
-    allowed: true,
-    retryAfterS: 0,
-    remaining: Math.max(0, WINDOW_MAX - b.failures.length),
-  };
+  return { allowed: true, retryAfterS: 0, remaining: Math.max(0, max - b.failures.length) };
 }
 
-export function throttleFailure(key: string): ThrottleState {
+function failBucket(key: string, max: number, lockoutMs: number, label: string): ThrottleState {
   const b = bucketFor(key);
   const now = Date.now();
   b.failures = b.failures.filter((t) => t > now - WINDOW_MS);
   b.failures.push(now);
-  if (b.failures.length >= WINDOW_MAX) {
-    b.lockedUntil = now + LOCKOUT_MS;
+  if (b.failures.length >= max) {
+    b.lockedUntil = now + lockoutMs;
     b.failures = [];
     console.warn(
-      `[ops-console] login lockout for ${LOCKOUT_MS / 60000}m after ${WINDOW_MAX} failed attempts from ${key}`,
+      `[ops-console] ${label} login lockout for ${lockoutMs / 60000}m after ${max} failed attempts (${key})`,
     );
-    return { allowed: false, retryAfterS: LOCKOUT_MS / 1000, remaining: 0 };
+    return { allowed: false, retryAfterS: Math.ceil(lockoutMs / 1000), remaining: 0 };
   }
+  return { allowed: true, retryAfterS: 0, remaining: Math.max(0, max - b.failures.length) };
+}
+
+/** The stricter of the two layers wins. */
+function tighter(a: ThrottleState, b: ThrottleState): ThrottleState {
+  if (a.allowed && b.allowed) {
+    return { allowed: true, retryAfterS: 0, remaining: Math.min(a.remaining, b.remaining) };
+  }
+  const blocked = !a.allowed ? a : b;
+  const other = !a.allowed ? b : a;
   return {
-    allowed: true,
-    retryAfterS: 0,
-    remaining: Math.max(0, WINDOW_MAX - b.failures.length),
+    allowed: false,
+    retryAfterS: Math.max(blocked.retryAfterS, other.allowed ? 0 : other.retryAfterS),
+    remaining: 0,
   };
 }
 
+export function throttleCheck(key: string): ThrottleState {
+  sweep();
+  // The global bucket is evaluated first and cannot be sidestepped by spoofing
+  // X-Forwarded-For, because it is not keyed on anything the caller controls.
+  return tighter(checkBucket(GLOBAL_KEY, GLOBAL_MAX), checkBucket(key, WINDOW_MAX));
+}
+
+export function throttleFailure(key: string): ThrottleState {
+  // Both layers are always charged, so header rotation buys attempts against
+  // the per-client budget only — never against the process-wide floor.
+  const g = failBucket(GLOBAL_KEY, GLOBAL_MAX, GLOBAL_LOCKOUT_MS, "GLOBAL");
+  const c = failBucket(key, WINDOW_MAX, LOCKOUT_MS, "per-client");
+  return tighter(g, c);
+}
+
+/**
+ * A successful sign-in clears that client's bucket. It deliberately does NOT
+ * clear the global bucket: knowing the password must not hand an attacker a
+ * way to reset the floor that is protecting it.
+ */
 export function throttleReset(key: string) {
+  if (key === GLOBAL_KEY) return;
   buckets.delete(key);
 }
 

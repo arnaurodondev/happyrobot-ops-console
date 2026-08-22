@@ -136,9 +136,44 @@ const SCRIPT = [
   { mc: "999001", lane: null, outcome: "not_verified", reason: "not_found", startedMinAgo: 2210, durationS: 28, notes: "MC not found at FMCSA. Two attempts at the number, both no match." },
 ];
 
+/**
+ * ADVERSARIAL FIXTURES — seeded only with `--adversarial` (npm run seed:adversarial).
+ * These exist to prove the console's defences on screen, not to make it look good:
+ *
+ *   1. CEILING BREACH — the agent's ladder walks *through* max_buy and the booking
+ *      lands above it. Exercises the breach verdict, the "Over ceiling" flag, the
+ *      flagged-calls filter, and drags the adherence KPI off 100%.
+ *   2. UNTRUSTED SPEECH — `notes` is written by post-call AI extraction from what
+ *      the carrier said, so it is attacker-controlled text. This row carries HTML
+ *      injection, an event-handler payload, and four spreadsheet formula prefixes
+ *      (=, +, -, @) that execute on open in Excel if a CSV writer is naive.
+ *
+ * Both live in the same reserved run_id namespace, so `npm run seed:purge`
+ * removes them with everything else.
+ */
+const XSS_NOTES =
+  `<script>alert('xss')</script> <img src=x onerror="alert(document.cookie)"> ` +
+  `"><svg/onload=alert(1)> &lt;b&gt;already-encoded&lt;/b&gt; ` +
+  `Carrier said the rate was =cmd|' /C calc'!A0 and +1+1 and -2+3 and @SUM(1+1) — ` +
+  `also 'single' and "double" quotes, a comma, and a\nnewline.`;
+
+const ADVERSARIAL = [
+  {
+    mc: "445120", lane: 2, outcome: "booked", rounds: 3, breach: true,
+    startedMinAgo: 61, durationS: 288,
+    notes: "ADVERSARIAL FIXTURE — agent walked the ladder through the ceiling and booked above max_buy. Expected: BREACH verdict, Over-ceiling flag, adherence below 100%.",
+  },
+  {
+    mc: "610337", lane: 5, outcome: "negotiation_failed", reason: "round_cap", rounds: 2,
+    startedMinAgo: 74, durationS: 199,
+    notes: XSS_NOTES,
+  },
+];
+
 // --- SQL emit --------------------------------------------------------------
 
-function buildInserts() {
+function buildInserts(adversarial = false) {
+  const script = adversarial ? [...SCRIPT, ...ADVERSARIAL] : SCRIPT;
   const stmts = [];
   const runIds = [];
   const mcs = new Set();
@@ -176,7 +211,7 @@ function buildInserts() {
   const books = [];
   const dumps = [];
 
-  SCRIPT.forEach((s, i) => {
+  script.forEach((s, i) => {
     const rid = runId(i);
     runIds.push(rid);
     const started = minutesAgo(s.startedMinAgo);
@@ -285,7 +320,9 @@ function buildInserts() {
     }
 
     // ---- negotiation_rounds: opening pitch is round 0 and consumes no round
-    const ladder = [0.88, 0.92, 0.96, 0.99];
+    // The compliant ladder asymptotes to the ceiling and never reaches it.
+    // The adversarial one walks straight through it.
+    const ladder = s.breach ? [0.94, 0.99, 1.02, 1.07] : [0.88, 0.92, 0.96, 0.99];
     let base = started.getTime() + 110_000;
     rounds.push(`(${q(rid)}, ${q(pitchedLoadId)}, 0, 'agent', ${n(opening)}, 'counter', ${q(ts(new Date(base)))})`);
 
@@ -351,7 +388,7 @@ function buildInserts() {
   // the dump by design, so only completed runs get a row here. Every column is
   // text, including the logically numeric ones.
   const dumpRows = [];
-  SCRIPT.forEach((s, i) => {
+  script.forEach((s, i) => {
     const rid = runId(i);
     if (s.outcome === "abandoned") return; // the dump never sees an abandoned run
     const lane = s.lane === null || s.lane === undefined ? null : LANES[s.lane];
@@ -359,7 +396,7 @@ function buildInserts() {
     const posted = lane ? 1400 + ((s.lane * 431 + i * 97) % 1600) + Math.round(lane[3] * 0.9) : null;
     const finalRate =
       s.outcome === "booked" && posted
-        ? String(Math.round(rates(posted).maxBuy * [0.88, 0.92, 0.96, 0.99][Math.min(s.rounds ?? 0, 3)]))
+        ? String(Math.round(rates(posted).maxBuy * (s.breach ? [0.94, 0.99, 1.02, 1.07] : [0.88, 0.92, 0.96, 0.99])[Math.min(s.rounds ?? 0, 3)]))
         : null;
     dumpRows.push(
       `(${q(rid)}, ${q(s.outcome)}, ${q(finalRate)}, ${q(String(s.rounds ?? 0))}, ${q(s.mc)}, ${q(lid)}, ${q(s.notes)})`,
@@ -387,18 +424,20 @@ function buildPurge(mcs) {
 }
 
 async function main() {
+  const adversarial = process.argv.includes("--adversarial");
   const mode = process.argv.includes("--purge")
     ? "purge"
-    : process.argv.includes("--apply")
+    : process.argv.includes("--apply") || adversarial
       ? "apply"
       : "help";
 
   if (mode === "help") {
-    console.log("Usage: node scripts/seed-demo.mjs --apply | --purge");
+    console.log("Usage: node scripts/seed-demo.mjs --apply [--adversarial] | --purge");
     process.exit(2);
   }
 
-  const { stmts, runIds, mcs } = buildInserts();
+  // Purge always covers the full namespace, adversarial rows included.
+  const { stmts, runIds, mcs } = buildInserts(adversarial);
 
   if (mode === "purge") {
     console.log(`Purging demo data from Twin at ${BASE} …`);
@@ -410,7 +449,10 @@ async function main() {
     return;
   }
 
-  console.log(`Seeding ${SCRIPT.length} demo calls into Twin at ${BASE} …`);
+  console.log(
+    `Seeding ${SCRIPT.length + (adversarial ? ADVERSARIAL.length : 0)} demo calls` +
+      `${adversarial ? " (INCLUDING ADVERSARIAL FIXTURES)" : ""} into Twin at ${BASE} …`,
+  );
   console.log("  purge with: npm run seed:purge");
   // Idempotent: re-running is a no-op thanks to ON CONFLICT / the purge-first.
   for (const s of buildPurge(mcs)) await run(s);

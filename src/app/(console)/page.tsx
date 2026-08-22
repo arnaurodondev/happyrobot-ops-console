@@ -235,10 +235,26 @@ function KpiRow({ kpis: k }: { kpis: Kpis }) {
         value={adherence === null ? EMPTY : percent(adherence, 0)}
         sub={
           k.ceilingKnown
-            ? `${integer(k.ceilingOk)} of ${integer(k.ceilingKnown)} bookings at or under max_buy`
+            ? `${integer(k.ceilingOk)} of ${integer(k.ceilingKnown)} bookings at or under max_buy${
+                k.ceilingQuoted > 0
+                  ? ` · ${integer(k.ceilingQuoted)} call(s) quoted the ceiling`
+                  : ""
+              }`
             : "No booking has a reconstructable ceiling"
         }
-        tone={adherence === null ? undefined : adherence >= 100 ? "ok" : "bad"}
+        // The headline percentage is the ENFORCEMENT test (agreed <= max_buy).
+        // DISCLOSURE is a separate failure with no natural denominator, so it
+        // cannot move the number — but it must never leave this tile green,
+        // otherwise the overview contradicts the per-call verdict below it.
+        tone={
+          k.ceilingQuoted > 0 || k.ceilingLeaked > 0
+            ? "bad"
+            : adherence === null
+              ? undefined
+              : adherence >= 100
+                ? "ok"
+                : "bad"
+        }
         fill={adherence}
       />
       <Kpi
@@ -275,7 +291,11 @@ function KpiRow({ kpis: k }: { kpis: Kpis }) {
 function ComplianceBlock({ kpis: k, range }: { kpis: Kpis; range: string }) {
   const breaches = k.ceilingKnown - k.ceilingOk;
   const anySignal =
-    breaches > 0 || k.ceilingLeaked > 0 || k.fraudFlagged > 0 || k.tms.ambiguous > 0;
+    breaches > 0 ||
+    k.ceilingQuoted > 0 ||
+    k.ceilingLeaked > 0 ||
+    k.fraudFlagged > 0 ||
+    k.tms.ambiguous > 0;
 
   return (
     <div className="cols two">
@@ -299,10 +319,36 @@ function ComplianceBlock({ kpis: k, range }: { kpis: Kpis; range: string }) {
             </Callout>
           )}
 
+          {k.ceilingQuoted > 0 && (
+            <Callout
+              tone="bad"
+              title={`${integer(k.ceilingQuoted)} call(s) where the agent quoted at or above the ceiling`}
+            >
+              Quoting <code>max_buy</code> discloses it to the dollar, whatever the call
+              eventually booked at. The ladder must asymptote to the ceiling and never
+              reach it.
+            </Callout>
+          )}
+
           <table className="kv">
             <tbody>
               <tr>
-                <th>Disclosure audit (Auditor node)</th>
+                <th>Disclosure — quoted ceiling</th>
+                <td>
+                  {k.ceilingQuoted > 0 ? (
+                    <Pill tone="bad">{integer(k.ceilingQuoted)} call(s)</Pill>
+                  ) : (
+                    <Pill tone="ok">Never reached</Pill>
+                  )}
+                  <span className="muted">
+                    {" "}
+                    · computed here from <code>negotiation_rounds</code>, not trusted
+                    from a column
+                  </span>
+                </td>
+              </tr>
+              <tr>
+                <th>Disclosure — Auditor node</th>
                 <td>
                   {k.ceilingAudited === 0 ? (
                     <Pill tone="mute">Not run on any call</Pill>
@@ -311,6 +357,7 @@ function ComplianceBlock({ kpis: k, range }: { kpis: Kpis; range: string }) {
                   ) : (
                     <Pill tone="ok">Clean on {integer(k.ceilingAudited)} audited call(s)</Pill>
                   )}
+                  <span className="muted"> · indirect disclosure in the transcript</span>
                 </td>
               </tr>
               <tr>

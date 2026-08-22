@@ -28,6 +28,7 @@ const HEADER = [
   "ceiling_ok",
   "fraud_signal",
   "ceiling_disclosed",
+  "agent_quoted_at_or_above_ceiling",
   "run_dump_present",
   "notes",
 ];
@@ -83,6 +84,7 @@ export async function GET(request: Request) {
           r.maxBuy !== null && r.agreedRate !== null ? r.agreedRate <= r.maxBuy : "",
           r.fraudSignal ?? "",
           r.ceilingDisclosed ?? "",
+          r.ceilingQuoted,
           r.hasDump,
           r.notes ?? "",
         ]),
