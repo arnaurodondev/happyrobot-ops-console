@@ -1,0 +1,31 @@
+{
+  "name": "carrier-sales-ops-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Operations console for the HappyRobot Logistics AI carrier-sales agent. Reads the Twin system of record; never the raw platform logs.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "seed:demo": "node scripts/seed-demo.mjs --apply",
+    "seed:purge": "node scripts/seed-demo.mjs --purge",
+    "smoke:auth": "node scripts/smoke-auth.mjs"
+  },
+  "dependencies": {
+    "next": "15.5.23",
+    "react": "19.1.1",
+    "react-dom": "19.1.1",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "typescript": "5.8.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

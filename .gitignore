@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+build/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# Downloaded from the App's "Develop locally" panel — contains real secrets.
+.env
+.env.local
+.env*.local
+
+# ...but the template is committed. The repo-root .gitignore excludes .env.*,
+# so this negation has to be here and the file added once with `git add -f`.
+!.env.local.example
