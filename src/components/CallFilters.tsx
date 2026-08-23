@@ -16,6 +16,8 @@ export default function CallFilters({
   flagged,
   environments,
   outcomes,
+  mc,
+  tms,
   exportHref,
 }: {
   range: string;
@@ -25,6 +27,8 @@ export default function CallFilters({
   flagged: boolean;
   environments: string[];
   outcomes: readonly string[];
+  mc: string;
+  tms: string;
   exportHref: string;
 }) {
   const formRef = useRef<HTMLFormElement>(null);
@@ -32,6 +36,12 @@ export default function CallFilters({
 
   return (
     <form className="toolbar" method="get" action="/calls" ref={formRef}>
+      {/* Narrowings that arrive from a link rather than a control. They ride
+          along on submit so applying a filter cannot silently widen the view
+          the operator is looking at — and so the Export CSV href beside them
+          keeps covering exactly the rows on screen. */}
+      {mc && <input type="hidden" name="mc" value={mc} />}
+      {tms && <input type="hidden" name="tms" value={tms} />}
       <div className="field grow">
         <label htmlFor="f-q">Search</label>
         <input

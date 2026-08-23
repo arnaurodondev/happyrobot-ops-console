@@ -9,6 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "node --test scripts/test-*.mjs",
     "seed:demo": "node scripts/seed-demo.mjs --apply",
     "seed:adversarial": "node scripts/seed-demo.mjs --apply --adversarial",
     "seed:purge": "node scripts/seed-demo.mjs --purge",

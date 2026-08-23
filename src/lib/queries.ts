@@ -14,6 +14,7 @@ import {
   utc,
   type TwinRow,
 } from "./twin";
+import { RANGES as RANGE_SPECS } from "./callParams";
 
 /**
  * Every screen's SQL lives here, in one file, so the read surface of the
@@ -26,15 +27,9 @@ import {
  *   call_outcomes.* -> all text, including response_final_rate / _rounds_count
  */
 
-export const CALL_OUTCOMES = [
-  "booked",
-  "negotiation_failed",
-  "not_verified",
-  "otp_failed",
-  "no_loads",
-  "abandoned",
-  "error",
-] as const;
+// The filter vocabulary lives in ./callParams (dependency-free so the page, the
+// JSON API, the CSV export and the tests all read a request identically).
+export { CALL_OUTCOMES, RANGES, TMS_SYNC_STATES } from "./callParams";
 
 /** A call with no ended_at older than this is treated as abandoned (§D note 3). */
 const ABANDON_AFTER = raw("interval '30 minutes'");
@@ -51,18 +46,12 @@ export interface CallFilters {
   mc?: string | null;
   q?: string | null;
   flagged?: boolean;
+  /** Latest booking's tms_sync_state. Filtered in SQL — see callWhere(). */
+  tms?: string | null;
 }
 
-export const RANGES: Record<string, { label: string; hours: number | null }> = {
-  today: { label: "Today (UTC)", hours: 0 },
-  "24h": { label: "Last 24 hours", hours: 24 },
-  "7d": { label: "Last 7 days", hours: 24 * 7 },
-  "30d": { label: "Last 30 days", hours: 24 * 30 },
-  all: { label: "All time", hours: null },
-};
-
 export function rangeClause(range: string): string {
-  const spec = RANGES[range] ?? RANGES["7d"];
+  const spec = RANGE_SPECS[range] ?? RANGE_SPECS["7d"];
   if (spec.hours === null) return "TRUE";
   if (spec.hours === 0) return `c.started_at >= date_trunc('day', ${NOW_UTC.text})`;
   return `c.started_at >= ${NOW_UTC.text} - interval '${spec.hours} hours'`;
@@ -96,11 +85,25 @@ const CEILING_QUOTED_EXISTS = `EXISTS (
 
 const CEILING_SIGNAL_EXISTS = `(${CEILING_BREACH_EXISTS} OR ${CEILING_QUOTED_EXISTS})`;
 
+/** The TMS sync state the call log shows: the run's most recent booking. */
+const LATEST_TMS_STATE = `(
+  SELECT bo_t.tms_sync_state FROM bookings bo_t
+  WHERE bo_t.run_id = c.run_id
+  ORDER BY bo_t.booked_at DESC NULLS LAST, bo_t.booking_id DESC LIMIT 1
+)`;
+
 function callWhere(f: CallFilters, range: string): string {
   const parts: string[] = [rangeClause(range)];
   if (f.environment) parts.push(sql`c.environment = ${f.environment}`);
   if (f.outcome) parts.push(sql`c.outcome = ${f.outcome}`);
   if (f.mc) parts.push(sql`c.mc_number = ${f.mc}`);
+  // TMS sync state is a property of the run's LATEST booking — the same row the
+  // table's TMS column renders (CALL_LOG_FROM's `bk` lateral). Expressed as a
+  // scalar subquery so the identical predicate works in the row query, the
+  // count query and the CSV export. It MUST stay in SQL: narrowing the fetched
+  // page client-side would make the "TMS exceptions" export cover rows the
+  // operator never saw, and would hide matches beyond the row cap.
+  if (f.tms) parts.push(sql`${raw(LATEST_TMS_STATE)} = ${f.tms}`);
   // "Flagged" has to mean every compliance signal the console itself raises,
   // not just the two boolean columns the workflow wrote. A booking above
   // max_buy, or an agent quote that touched the ceiling, is the finding an ops
@@ -172,10 +175,25 @@ WITH c AS (
   SELECT n.* FROM negotiation_rounds n JOIN c ON c.run_id = n.run_id
 ), bk AS (
   SELECT bo.* FROM bookings bo JOIN c ON c.run_id = bo.run_id
+), lo1 AS (
+  -- One offer row per (run, load). A retried write or a re-search can leave two
+  -- load_offers rows for the same load on the same run. Without this, the join
+  -- below counts that booking twice, inflating ceiling_known / ceiling_ok and
+  -- skewing avg_agreed and avg_agreed_vs_posted. The pitched row wins, then the
+  -- earliest — the same precedence the lo lateral in the log query uses.
+  -- NB: keep apostrophes, semicolons and write keywords out of SQL comments.
+  -- The read-only guard in twin.ts scans the whole statement, comments too.
+  SELECT DISTINCT ON (run_id, load_id) *
+  FROM lo ORDER BY run_id, load_id, was_pitched DESC NULLS LAST, id ASC
+), bk1 AS (
+  -- Same defence on the booking side. bookings carries UNIQUE(run_id, load_id)
+  -- today, and this query should not be what breaks if that ever changes.
+  SELECT DISTINCT ON (run_id, load_id) *
+  FROM bk ORDER BY run_id, load_id, booked_at DESC NULLS LAST, booking_id DESC
 ), ceil AS (
-  SELECT bk.run_id, bk.agreed_rate, lo.posted_rate,
-         NULLIF(lo.load_snapshot->>'max_buy','')::bigint AS max_buy
-  FROM bk JOIN lo ON lo.run_id = bk.run_id AND lo.load_id = bk.load_id
+  SELECT bk1.run_id, bk1.agreed_rate, lo1.posted_rate,
+         NULLIF(lo1.load_snapshot->>'max_buy','')::bigint AS max_buy
+  FROM bk1 JOIN lo1 ON lo1.run_id = bk1.run_id AND lo1.load_id = bk1.load_id
 ), rpr AS (
   SELECT run_id, max(round_no) FILTER (WHERE actor = 'agent') AS agent_rounds
   FROM nr GROUP BY run_id
@@ -197,10 +215,10 @@ SELECT
   (SELECT count(*) FROM oa WHERE verified IS NOT TRUE AND failure_reason IS DISTINCT FROM 'sent') AS otp_failed,
   (SELECT count(*) FROM otp_lock) AS otp_lockouts,
   (SELECT count(DISTINCT run_id) FROM bk) AS booked_runs,
-  (SELECT count(*) FROM bk WHERE tms_sync_state = 'synced') AS tms_synced,
-  (SELECT count(*) FROM bk WHERE tms_sync_state = 'pending') AS tms_pending,
-  (SELECT count(*) FROM bk WHERE tms_sync_state = 'failed') AS tms_failed,
-  (SELECT count(*) FROM bk WHERE tms_sync_state = 'ambiguous') AS tms_ambiguous,
+  (SELECT count(*) FROM bk1 WHERE tms_sync_state = 'synced') AS tms_synced,
+  (SELECT count(*) FROM bk1 WHERE tms_sync_state = 'pending') AS tms_pending,
+  (SELECT count(*) FROM bk1 WHERE tms_sync_state = 'failed') AS tms_failed,
+  (SELECT count(*) FROM bk1 WHERE tms_sync_state = 'ambiguous') AS tms_ambiguous,
   (SELECT round(avg(agent_rounds), 2) FROM rpr WHERE agent_rounds > 0) AS avg_rounds,
   (SELECT count(*) FROM rpr WHERE agent_rounds > 0) AS negotiated_runs,
   (SELECT round(avg(agreed_rate)) FROM ceil) AS avg_agreed,
@@ -367,7 +385,8 @@ LEFT JOIN LATERAL (
   ORDER BY l.was_pitched DESC NULLS LAST, l.id ASC LIMIT 1
 ) lo ON TRUE
 LEFT JOIN LATERAL (
-  SELECT bo.* FROM bookings bo WHERE bo.run_id = c.run_id ORDER BY bo.booked_at DESC LIMIT 1
+  SELECT bo.* FROM bookings bo WHERE bo.run_id = c.run_id
+  ORDER BY bo.booked_at DESC NULLS LAST, bo.booking_id DESC LIMIT 1
 ) bk ON TRUE
 LEFT JOIN LATERAL (
   SELECT max(n.round_no) AS rounds FROM negotiation_rounds n
@@ -837,13 +856,23 @@ export interface CarrierSummary extends CarrierRecord {
   fraudSignals: number;
 }
 
-export async function getCarriers(q?: string | null): Promise<CarrierSummary[]> {
-  const filter = q
-    ? sql`WHERE (cr.mc_number ILIKE ${`%${q}%`} OR cr.legal_name ILIKE ${`%${q}%`} OR cr.dot_number ILIKE ${`%${q}%`})`
-    : "";
-  const { rows } = await twinQuery(`
-SELECT cr.mc_number, cr.dot_number, cr.legal_name, cr.authority_ok, cr.status,
+/**
+ * The per-MC rollup, driven by a *set of MC numbers* rather than by the
+ * `carriers` table. Two callers share it:
+ *
+ *   getCarriers()       — every MC in the carrier master (capped at 500)
+ *   getCarrierSummary() — exactly one MC, resolved in the database
+ *
+ * Driving off the MC, with `carriers` LEFT JOINed, means an MC that was spoken
+ * on a call but never landed in the master (a not-found FMCSA lookup writes no
+ * snapshot) still gets REAL call, booking and risk counts instead of a
+ * synthesised row of zeroes.
+ */
+function carrierSummarySql(mcSource: string, tail = ""): string {
+  return `
+SELECT m.mc_number, cr.dot_number, cr.legal_name, cr.authority_ok, cr.status,
        cr.verified_at, cc.email_masked, cc.source AS contact_source,
+       (cr.mc_number IS NOT NULL)    AS in_master,
        COALESCE(s.calls, 0)          AS calls,
        COALESCE(s.bookings, 0)       AS bookings,
        COALESCE(s.fraud_signals, 0)  AS fraud_signals,
@@ -851,8 +880,9 @@ SELECT cr.mc_number, cr.dot_number, cr.legal_name, cr.authority_ok, cr.status,
        COALESCE(v.failed, 0)         AS failed_verifications,
        COALESCE(o.failed, 0)         AS otp_failures,
        s.avg_agreed_rate
-FROM carriers cr
-LEFT JOIN carrier_contacts cc ON cc.mc_number = cr.mc_number
+FROM ${mcSource} m
+LEFT JOIN carriers cr ON cr.mc_number = m.mc_number
+LEFT JOIN carrier_contacts cc ON cc.mc_number = m.mc_number
 LEFT JOIN LATERAL (
   -- DISTINCT throughout: this is a LEFT JOIN, so a run with two bookings would
   -- otherwise be counted as two calls and two fraud signals.
@@ -862,23 +892,23 @@ LEFT JOIN LATERAL (
          count(DISTINCT bo.booking_id) AS bookings,
          round(avg(bo.agreed_rate)) AS avg_agreed_rate
   FROM calls c LEFT JOIN bookings bo ON bo.run_id = c.run_id
-  WHERE c.mc_number = cr.mc_number
+  WHERE c.mc_number = m.mc_number
 ) s ON TRUE
 LEFT JOIN LATERAL (
   SELECT count(*) AS failed FROM verification_events ve
-  WHERE ve.mc_number = cr.mc_number AND ve.verified IS NOT TRUE
+  WHERE ve.mc_number = m.mc_number AND ve.verified IS NOT TRUE
 ) v ON TRUE
 LEFT JOIN LATERAL (
   SELECT count(*) AS failed FROM otp_attempts oa
   JOIN calls c2 ON c2.run_id = oa.run_id
-  WHERE c2.mc_number = cr.mc_number AND oa.verified IS NOT TRUE
+  WHERE c2.mc_number = m.mc_number AND oa.verified IS NOT TRUE
     AND oa.failure_reason IS DISTINCT FROM 'sent'
 ) o ON TRUE
-${filter}
-ORDER BY s.last_call_at DESC NULLS LAST, cr.mc_number ASC
-LIMIT 500`);
+${tail}`;
+}
 
-  return rows.map((r) => ({
+function mapCarrierSummary(r: TwinRow): CarrierSummary {
+  return {
     mcNumber: text(r.mc_number) ?? "",
     dotNumber: text(r.dot_number),
     legalName: text(r.legal_name),
@@ -894,7 +924,42 @@ LIMIT 500`);
     otpFailures: count(r.otp_failures),
     avgAgreedRate: num(r.avg_agreed_rate),
     fraudSignals: count(r.fraud_signals),
-  }));
+  };
+}
+
+export async function getCarriers(q?: string | null): Promise<CarrierSummary[]> {
+  const filter = q
+    ? sql`WHERE (cr0.mc_number ILIKE ${`%${q}%`} OR cr0.legal_name ILIKE ${`%${q}%`} OR cr0.dot_number ILIKE ${`%${q}%`})`
+    : "";
+  const { rows } = await twinQuery(
+    carrierSummarySql(
+      `(SELECT cr0.mc_number FROM carriers cr0 ${filter})`,
+      `ORDER BY s.last_call_at DESC NULLS LAST, m.mc_number ASC
+LIMIT 500`,
+    ),
+  );
+  return rows.map(mapCarrierSummary);
+}
+
+/**
+ * One carrier, resolved in SQL. Returns null only when the MC is absent from
+ * the carrier master AND has no calls, bookings, verifications or OTP attempts
+ * — i.e. genuinely unknown. It never scans a capped list and never invents a
+ * zero for a carrier that simply sorted past a row limit.
+ */
+export async function getCarrierSummary(
+  mc: string,
+): Promise<{ summary: CarrierSummary; known: boolean } | null> {
+  const row = await twinQueryOne(carrierSummarySql(sql`(SELECT ${mc}::text AS mc_number)`));
+  if (!row) return null; // a one-row VALUES source: only a Twin fault gets here
+  const summary = mapCarrierSummary({ ...row, mc_number: mc });
+  const known =
+    bool(row.in_master) === true ||
+    summary.calls > 0 ||
+    summary.bookings > 0 ||
+    summary.failedVerifications > 0 ||
+    summary.otpFailures > 0;
+  return { summary, known };
 }
 
 export interface CarrierDetail {
@@ -904,10 +969,11 @@ export interface CarrierDetail {
 }
 
 export async function getCarrierDetail(mc: string): Promise<CarrierDetail | null> {
-  const list = await getCarriers(null);
-  const carrier = list.find((c) => c.mcNumber === mc);
-
-  const [callRes, verifRes] = await Promise.all([
+  // Resolve the ONE carrier in the database. Scanning a 500-row list and
+  // falling back to a synthesised record reported "0 bookings" for any carrier
+  // past the cap — a wrong number, which is worse than a missing screen.
+  const [summary, callRes, verifRes] = await Promise.all([
+    getCarrierSummary(mc),
     twinQuery(`SELECT ${CALL_LOG_SELECT} ${CALL_LOG_FROM} WHERE ${sql`c.mc_number = ${mc}`}
 ORDER BY c.started_at DESC NULLS LAST LIMIT 200`),
     twinQuery(sql`SELECT ve.id, ve.run_id::text AS run_id, ve.mc_number, ve.verified, ve.reason,
@@ -916,28 +982,16 @@ FROM verification_events ve WHERE ve.mc_number = ${mc}
 ORDER BY ve.checked_at DESC NULLS LAST LIMIT 100`),
   ]);
 
-  if (!carrier && !callRes.rows.length && !verifRes.rows.length) return null;
+  // Not-found is a state, not a row of zeroes: nothing in the master, no calls,
+  // no verifications. The page renders its own not-found for null.
+  if (!summary || (!summary.known && !callRes.rows.length && !verifRes.rows.length)) return null;
 
   return {
-    carrier: carrier ?? {
-      // A carrier can appear in verification_events (MC as spoken) without ever
-      // landing in `carriers` — a not-found MC never gets an FMCSA snapshot.
-      mcNumber: mc,
-      dotNumber: null,
-      legalName: null,
-      authorityOk: null,
-      status: null,
-      verifiedAt: null,
-      emailMasked: null,
-      contactSource: null,
-      calls: callRes.rows.length,
-      bookings: 0,
-      lastCallAt: null,
-      failedVerifications: verifRes.rows.length,
-      otpFailures: 0,
-      avgAgreedRate: null,
-      fraudSignals: 0,
-    },
+    // A carrier can appear in verification_events (MC as spoken) without ever
+    // landing in `carriers` — a not-found MC never gets an FMCSA snapshot. The
+    // rollups below are still measured, not assumed: carrierSummarySql() drives
+    // off the MC and LEFT JOINs the master.
+    carrier: summary.summary,
     calls: callRes.rows.map(mapCallLogRow),
     verifications: verifRes.rows.map((r) => ({
       runId: text(r.run_id) ?? "",

@@ -63,11 +63,11 @@ The seeder is **fully reversible by construction**: every seeded call uses a `ru
 | Booking conversion | `bookings` ÷ `calls` |
 | Verification pass rate | `verification_events.verified` |
 | OTP failure rate | `otp_attempts` (send rows excluded from the denominator) |
-| **Rate-ceiling adherence (target 100%)** | `bookings.agreed_rate ≤ load_offers.load_snapshot→max_buy` |
+| **Rate-ceiling adherence (target 100%)** | `bookings.agreed_rate ≤ load_offers.load_snapshot→max_buy`. The percentage is the *enforcement* test only. The tile turns **red on any disclosure signal** — an agent quote at or above `max_buy`, or the Auditor node's verdict — even at 100% adherence, because disclosure has no denominator to move the number and a green tile would contradict the per-call verdict. |
 | Average negotiation rounds (cap 3) | `max(negotiation_rounds.round_no) WHERE actor='agent'` |
 | Average agreed vs posted | mean of the per-load ratio `bookings.agreed_rate ÷ load_offers.posted_rate` (not the ratio of the two averages shown beside it — they differ by a few tenths on small samples) |
 | Average call duration, abandoned, in flight | `calls.started_at / ended_at` |
-| Fraud signals | `calls.fraud_signal`, ≥3 failed OTP attempts on a run, FMCSA rejections |
+| Fraud signals | `calls.fraud_signal IS TRUE` — that column alone. Failed FMCSA verifications and OTP lockouts (≥3 failed attempts on a run) are counted and shown as their **own** KPIs beside it, never folded into this one. |
 | **Ceiling disclosure — quoted** | `negotiation_rounds.amount >= max_buy WHERE actor='agent'` — computed here, not trusted from a column. Quoting the ceiling discloses it to the dollar, so `>=` is the test. |
 | Ceiling disclosure — Auditor node | `calls.ceiling_disclosed` (the native Carrier Sales Auditor node's verdict on indirect disclosure in the transcript) |
 | TMS sync exceptions | `bookings.tms_sync_state` — `ambiguous` is never auto-retried |
@@ -232,6 +232,7 @@ Each save triggers a redeploy automatically. Values are write-only after saving 
 ### 4. Verify the deployment
 
 ```bash
+npm test                                                  # filter/export regression suite (no DB, no server)
 BASE=https://<slug>.happyrobot.ai npm run smoke:auth      # every /api/* route must 401
 curl -s https://<slug>.happyrobot.ai/api/health           # {"ok":true}
 ```
@@ -256,7 +257,7 @@ $ npm run build
    - Environments: .env.local
 
    Creating an optimized production build ...
- ✓ Compiled successfully in 1992ms
+ ✓ Compiled successfully in 1049ms
    Linting and checking validity of types ...
    Collecting page data ...
    Generating static pages (0/3) ...
@@ -276,7 +277,7 @@ Route (app)                                 Size  First Load JS
 ├ ƒ /api/export/calls/[runId]              149 B         103 kB
 ├ ƒ /api/health                            149 B         103 kB
 ├ ƒ /api/kpis                              149 B         103 kB
-├ ƒ /calls                               1.94 kB         108 kB
+├ ƒ /calls                               1.98 kB         108 kB
 ├ ƒ /calls/[runId]                         990 B         107 kB
 ├ ƒ /carriers                              989 B         107 kB
 ├ ƒ /carriers/[mc]                         990 B         107 kB
@@ -293,7 +294,9 @@ Route (app)                                 Size  First Load JS
 ƒ  (Dynamic)  server-rendered on demand
 ```
 
-Every data route is `ƒ` (server-rendered on demand). The only static asset is the 404 page. `npm run typecheck` is clean.
+Every data route is `ƒ` (server-rendered on demand). The only static asset is the 404 page. `npm run typecheck` is clean, and `npm test` (the filter/export regression suite, no database required) passes.
+
+The compile time above is one run on one laptop — treat it as an order of magnitude, not a benchmark. The route table is the part worth diffing.
 
 **Dependency posture:** Next is pinned to `15.5.23`, the patched release for the whole 15.5.x advisory set. `npm audit` reports three remaining highs, all in `sharp` — an optional transitive dependency of `next/image`. The console renders no images and `images.unoptimized` is set in `next.config.ts`, so the Image Optimizer never runs. Clearing them means Next 16, which is a breaking change and out of scope for this build.
 

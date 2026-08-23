@@ -2,13 +2,14 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { requireSession } from "@/lib/auth";
 import { describeError } from "@/lib/errors";
+import { getCallLog, getEnvironments, type CallLogRow } from "@/lib/queries";
 import {
   CALL_OUTCOMES,
   RANGES,
-  getCallLog,
-  getEnvironments,
-  type CallLogRow,
-} from "@/lib/queries";
+  exportParams,
+  hasFilters,
+  parseCallQuery,
+} from "@/lib/callParams";
 import {
   Empty,
   ErrorState,
@@ -41,24 +42,18 @@ export default async function CallsPage({
   await requireSession("/calls"); // FIRST STATEMENT — see lib/auth.ts
 
   const params = await searchParams;
-  const str = (k: string) => (typeof params[k] === "string" ? (params[k] as string) : "");
-
-  const range = Object.keys(RANGES).includes(str("range")) ? str("range") : "7d";
-  const outcome = (CALL_OUTCOMES as readonly string[]).includes(str("outcome"))
-    ? str("outcome")
-    : "";
-  const environment = str("environment");
-  const q = str("q");
-  const mc = str("mc");
-  const flagged = str("flagged") === "1";
-  // "TMS exceptions" is a client-side narrowing of the same query — the Twin
-  // caps make a dedicated aggregate unnecessary at this row count.
-  const tms = str("tms");
-
-  const exportParams = new URLSearchParams();
-  for (const [k, v] of Object.entries({ range, outcome, environment, q, mc, flagged: flagged ? "1" : "" })) {
-    if (v) exportParams.set(k, v);
+  const raw = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (typeof v === "string") raw.set(k, v);
+    else if (Array.isArray(v) && v.length) raw.set(k, v[0]);
   }
+
+  // One parse for the screen, the export link and the SQL. Every narrowing —
+  // including `tms` — is applied in the WHERE clause, so the table, the count
+  // and the CSV always describe the same set of rows.
+  const { query } = parseCallQuery(raw);
+  const { range, outcome, environment, q, mc, flagged, tms } = query;
+  const exportHref = `/api/export/calls?${exportParams(query).toString()}`;
 
   let result: Awaited<ReturnType<typeof getCallLog>> | null = null;
   let environments: string[] = [];
@@ -66,15 +61,26 @@ export default async function CallsPage({
 
   try {
     [result, environments] = await Promise.all([
-      getCallLog({ outcome: outcome || null, environment: environment || null, mc: mc || null, q: q || null, flagged }, range, 200),
+      getCallLog(
+        {
+          outcome: outcome || null,
+          environment: environment || null,
+          mc: mc || null,
+          q: q || null,
+          tms: tms || null,
+          flagged,
+        },
+        range,
+        200,
+      ),
       getEnvironments(),
     ]);
   } catch (err) {
     error = describeError(err);
   }
 
-  const rows = tms ? (result?.rows ?? []).filter((r) => r.tmsSyncState === tms) : (result?.rows ?? []);
-  const hasFilters = Boolean(outcome || environment || q || mc || flagged || tms) || range !== "7d";
+  const rows = result?.rows ?? [];
+  const filtered = hasFilters(query);
 
   return (
     <>
@@ -82,7 +88,7 @@ export default async function CallsPage({
         title="Call log"
         crumb={
           result
-            ? `${integer(rows.length)} of ${integer(result.total)} call(s) · ${RANGES[range]?.label}`
+            ? `${integer(rows.length)} of ${integer(result.total)} matching call(s) · ${RANGES[range]?.label}`
             : undefined
         }
         actions={
@@ -106,7 +112,9 @@ export default async function CallsPage({
           flagged={flagged}
           environments={environments}
           outcomes={CALL_OUTCOMES}
-          exportHref={`/api/export/calls?${exportParams.toString()}`}
+          mc={mc}
+          tms={tms}
+          exportHref={exportHref}
         />
 
         {(mc || tms) && (
@@ -131,16 +139,16 @@ export default async function CallsPage({
           ) : !rows.length ? (
             <Empty
               glyph="◎"
-              title={hasFilters ? "No calls match these filters" : "No calls recorded yet"}
+              title={filtered ? "No calls match these filters" : "No calls recorded yet"}
               action={
-                hasFilters ? (
+                filtered ? (
                   <Link className="btn" href="/calls?range=all">
                     Clear filters and widen to all time
                   </Link>
                 ) : null
               }
             >
-              {hasFilters
+              {filtered
                 ? "Try widening the time window or clearing the outcome filter. The console reads only the Twin system of record, so nothing is hidden behind a second data source."
                 : "The Twin calls table is empty for this window. Rows appear here as soon as the voice workflow's Write-to-Twin node opens a call."}
             </Empty>

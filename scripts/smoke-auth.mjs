@@ -77,6 +77,24 @@ for (const p of MUST_200_PUBLIC) {
   report("forged cookie", "/api/kpis", res.status, (s) => s === 401);
 }
 
+// Sign-out is public by design (it clears a cookie and discloses nothing), but
+// a cross-site page must not be able to force it.
+{
+  const evil = await fetch(`${BASE}/api/auth/logout`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { Origin: "https://evil.example", "Sec-Fetch-Site": "cross-site" },
+  });
+  report("cross-site logout", "/api/auth/logout (Origin: evil.example)", evil.status, (s) => s === 403);
+
+  const own = await fetch(`${BASE}/api/auth/logout`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { Origin: BASE, "Sec-Fetch-Site": "same-origin" },
+  });
+  report("same-origin logout", "/api/auth/logout", own.status, (s) => s === 200);
+}
+
 // Login throttle: the per-client bucket is keyed on X-Forwarded-For, which the
 // CLIENT sets, so rotating it defeats that layer by design. The control that
 // matters is the process-wide floor, which no header can move. Opt-in, because

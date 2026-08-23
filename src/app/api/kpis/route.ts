@@ -1,6 +1,7 @@
 import { requireApiSession } from "@/lib/auth";
-import { ok, searchString, twinError } from "@/lib/api";
+import { fail, ok, searchString, twinError } from "@/lib/api";
 import { getDailyTrend, getKpis, getOutcomeMix } from "@/lib/queries";
+import { DEFAULT_RANGE, RANGES, isRange } from "@/lib/callParams";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -10,7 +11,18 @@ export async function GET(request: Request) {
   if (denied) return denied;
 
   const params = new URL(request.url).searchParams;
-  const range = searchString(params, "range", "7d");
+  const requested = searchString(params, "range", DEFAULT_RANGE) || DEFAULT_RANGE;
+  // rangeClause() falls back to 7d for anything it does not recognise, so
+  // echoing the caller's string back would label 7-day numbers as, say, "90d".
+  // Reject instead: a mislabelled window is a wrong number, not a cosmetic bug.
+  if (!isRange(requested)) {
+    return fail(
+      400,
+      "invalid_range",
+      `range must be one of: ${Object.keys(RANGES).join(", ")}.`,
+    );
+  }
+  const range = requested;
   const environment = searchString(params, "environment") || null;
 
   try {

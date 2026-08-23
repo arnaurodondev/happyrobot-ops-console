@@ -1,6 +1,7 @@
 import { requireApiSession } from "@/lib/auth";
-import { searchString, twinError } from "@/lib/api";
+import { fail, twinError } from "@/lib/api";
 import { getCallLog } from "@/lib/queries";
+import { parseCallQuery } from "@/lib/callParams";
 import { csvRow } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -43,17 +44,28 @@ export async function GET(request: Request) {
   const denied = await requireApiSession(); // FIRST STATEMENT — see lib/auth.ts
   if (denied) return denied;
 
-  const params = new URL(request.url).searchParams;
-  const range = searchString(params, "range", "7d");
+  // The export MUST honour every narrowing the screen honours, and must refuse
+  // a filter it does not understand rather than quietly widening the set: this
+  // CSV is the artifact someone attaches to a dispute.
+  const { query, invalid } = parseCallQuery(new URL(request.url).searchParams);
+  if (invalid.length) {
+    return fail(
+      400,
+      "invalid_filter",
+      `Unrecognised value for: ${invalid.join(", ")}. Refusing to export a different set of rows than you asked for.`,
+    );
+  }
+  const { range } = query;
 
   try {
     const { rows } = await getCallLog(
       {
-        outcome: searchString(params, "outcome") || null,
-        environment: searchString(params, "environment") || null,
-        mc: searchString(params, "mc") || null,
-        q: searchString(params, "q") || null,
-        flagged: searchString(params, "flagged") === "1",
+        outcome: query.outcome || null,
+        environment: query.environment || null,
+        mc: query.mc || null,
+        q: query.q || null,
+        tms: query.tms || null,
+        flagged: query.flagged,
       },
       range,
       500,
