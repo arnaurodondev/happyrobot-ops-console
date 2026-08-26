@@ -48,7 +48,14 @@ export async function POST(request: Request) {
     return json(400, { error: "bad_request", message: "Expected a JSON body." });
   }
 
-  const user = typeof body.user === "string" ? body.user : configuredUser();
+  // An absent username is an EMPTY username, never the configured one.
+  // Defaulting to configuredUser() here meant `{"password": "..."}` with no
+  // user field authenticated: the username check did not fail, it ceased to
+  // exist. Verified against the running console — that body returned 200 and
+  // a valid session cookie. The password was still required, so this was
+  // never an open door, but "omit the field to skip the check" is not a
+  // property an auth boundary may have.
+  const user = typeof body.user === "string" ? body.user : "";
   const password = typeof body.password === "string" ? body.password : "";
 
   await loginDelay();
