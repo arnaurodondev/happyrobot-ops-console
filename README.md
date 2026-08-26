@@ -23,7 +23,7 @@ npm run dev                          # http://localhost:3000
 
 Sign in with `OPS_CONSOLE_USER` / `OPS_CONSOLE_PASSWORD`.
 
-No App needs to exist on the platform for this to work — the console talks to the platform API directly, so it is demoable before step 8 of the delivery plan is done.
+No App needs to exist on the platform for this to work — the console talks to the platform API directly. **This is how the console is demonstrated**; see the deployment section below for why.
 
 ### Demo data
 
@@ -187,25 +187,40 @@ Two schema realities the UI is built around:
 
 App creation is **UI-only**: the only App API operation is `POST /apps/{slug}/duplicate`. These steps cannot be scripted.
 
+> **Outcome, recorded.** The App was created. Its URL currently answers Vercel's
+> `404 DEPLOYMENT_NOT_FOUND` — the App exists, but no build has successfully deployed
+> into it, and the sandbox build log is not reachable from outside the sandbox. The code
+> is not the variable: a fresh clone of `github.com/arnaurodondev/happyrobot-ops-console`
+> builds clean with **no environment variables set at all** — 16 routes, no errors. The
+> console is therefore demonstrated with `npm run dev` against the same live Twin, and
+> the steps below are kept because they are still correct for anyone finishing the
+> import. What remains is steps 2 and 3: one import and three variables.
+
 ### 0. Prerequisite — deploy the Twin API Gateway first (optional but do it now)
 
 **Settings → Twin Database → Deploy Gateway**, wait for **Running**.
 
 This console does not use the gateway, but deploying it *before* the App exists means `NEXT_PUBLIC_TWIN_GATEWAY` is injected into the first build. Deploying it afterwards needs a redeploy to pick the variable up.
 
-### 1. Push this code to a GitHub repo you control
+### 1. Point the import at a repo whose root is this app — already done
 
-The import flow reads from a GitHub URL. `app/` must be the **repository root** of the repo you import — the platform validates that the source is a Next.js project by looking for `package.json` and `next.config.*` at the top level. Either push `app/` as its own repo, or use a subtree split:
+The import flow reads from a GitHub URL, and `app/` must be the **repository root** of the repo you import: the platform validates that the source is a Next.js project by looking for `package.json` and `next.config.*` at the top level.
+
+That repo already exists — **`https://github.com/arnaurodondev/happyrobot-ops-console`**, with the contents of `app/` at its root. Use it as the import source; there is nothing to split.
+
+To refresh it from this monorepo after a change here:
 
 ```bash
-git subtree push --prefix app origin ops-console-root
+git subtree push --prefix app ops-console master
 ```
+
+where `ops-console` is a remote pointing at that repository.
 
 ### 2. Create the App
 
 1. **Apps → Create App**
 2. Choose **Import from existing repo**
-3. **Source repository URL:** `https://github.com/<you>/<repo>`
+3. **Source repository URL:** `https://github.com/arnaurodondev/happyrobot-ops-console`
 4. **GitHub personal access token:** one with read access to that repo (used once, to fetch the source)
 5. **Name:** `Carrier Sales Ops` → the slug is generated automatically and is **immutable**
 6. **Description:** `Operational signals and call audit trail for the inbound carrier-sales agent`
