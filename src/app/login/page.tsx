@@ -18,6 +18,13 @@ export default async function LoginPage({
   const rawNext = typeof params.next === "string" ? params.next : "/";
   // Open-redirect guard: only same-origin absolute paths are ever honoured.
   const next = rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/";
+  // Set by the no-JS POST path, which cannot hand a message to React state.
+  // Without this a failed native submit returns a blank form and the user
+  // cannot tell a wrong password from a broken page.
+  const failed = params.error === "invalid" ? "Invalid credentials."
+    : params.error === "locked"
+      ? "Too many failed attempts. Locked for 15 minutes."
+      : null;
 
   if (session) redirect(next);
 
@@ -36,7 +43,7 @@ export default async function LoginPage({
         </div>
 
         {authConfigured() ? (
-          <LoginForm next={next} defaultUser={configuredUser()} />
+          <LoginForm next={next} defaultUser={configuredUser()} initialError={failed} />
         ) : (
           <div className="login-body">
             <div className="callout bad">

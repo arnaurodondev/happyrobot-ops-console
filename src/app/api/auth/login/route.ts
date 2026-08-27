@@ -41,12 +41,35 @@ export async function POST(request: Request) {
     );
   }
 
-  let body: { user?: unknown; password?: unknown };
+  // Two content types, deliberately. The JS path sends JSON; a NATIVE form
+  // submit — which is what happens whenever the client bundle has not
+  // hydrated — sends url-encoded. Accepting only JSON meant the browser fell
+  // back to a GET, putting the password in the query string, the address bar
+  // and the server log. A login form must not depend on JavaScript to keep
+  // the password out of the URL.
+  const ctype = request.headers.get("content-type") ?? "";
+  const isForm = ctype.includes("application/x-www-form-urlencoded")
+    || ctype.includes("multipart/form-data");
+  let body: { user?: unknown; password?: unknown; next?: unknown };
   try {
-    body = await request.json();
+    if (isForm) {
+      const form = await request.formData();
+      body = {
+        user: form.get("user") ?? undefined,
+        password: form.get("password") ?? undefined,
+        next: form.get("next") ?? undefined,
+      };
+    } else {
+      body = await request.json();
+    }
   } catch {
     return json(400, { error: "bad_request", message: "Expected a JSON body." });
   }
+
+  // Same open-redirect guard the login page applies: same-origin paths only.
+  const rawNext = typeof body.next === "string" ? body.next : "/";
+  const nextPath = rawNext.startsWith("/") && !rawNext.startsWith("//")
+    ? rawNext : "/";
 
   // An absent username is an EMPTY username, never the configured one.
   // Defaulting to configuredUser() here meant `{"password": "..."}` with no
@@ -72,6 +95,14 @@ export async function POST(request: Request) {
 
   if (!ok) {
     const after = throttleFailure(key);
+    if (isForm) {
+      // Never echo the submitted credentials back into the URL.
+      const q = new URLSearchParams({
+        next: nextPath,
+        error: after.allowed ? "invalid" : "locked",
+      });
+      return redirectTo(`/login?${q}`);
+    }
     return json(
       401,
       {
@@ -96,7 +127,16 @@ export async function POST(request: Request) {
     maxAge,
   });
 
+  if (isForm) return redirectTo(nextPath);
   return json(200, { ok: true, user });
+}
+
+/** 303 so the browser re-issues as GET and the POST never lands in history. */
+function redirectTo(location: string) {
+  return new Response(null, {
+    status: 303,
+    headers: { Location: location, "Cache-Control": "no-store" },
+  });
 }
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}) {
